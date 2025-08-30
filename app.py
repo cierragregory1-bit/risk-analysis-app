@@ -4,19 +4,19 @@ import matplotlib.pyplot as plt
 
 # ========== SETTINGS ==========
 REALTOR_API_KEY = "YOUR_RAPIDAPI_KEY"
-SCRAPER_API_KEY = "YOUR_SCRAPERAPI_KEY"
 
-# ========== DATA FETCHERS ==========
+# ========== DATA FETCHER ==========
 
 def fetch_comps_realtor(address, api_key):
     url = "https://realtor-com-real-estate.p.rapidapi.com/properties/v2/list-for-sale"
-    querystring = {"location": address, "limit": 5}  # pull 5 comps
+    querystring = {"location": address, "limit": 5}  # grab 5 comps
     headers = {
         "x-rapidapi-host": "realtor-com-real-estate.p.rapidapi.com",
         "x-rapidapi-key": api_key
     }
     try:
         response = requests.get(url, headers=headers, params=querystring, timeout=10)
+        response.raise_for_status()
         data = response.json().get("properties", [])
         comps = []
         for item in data:
@@ -28,19 +28,6 @@ def fetch_comps_realtor(address, api_key):
         return comps
     except Exception as e:
         st.error(f"Realtor API error: {e}")
-        return []
-
-def fetch_comps_zillow(address, scraper_api_key):
-    # Scrape Zillow results using ScraperAPI (basic HTML parse)
-    url = f"http://api.scraperapi.com?api_key={scraper_api_key}&url=https://www.zillow.com/homes/{address}"
-    try:
-        response = requests.get(url, timeout=15)
-        # NOTE: Zillow's HTML is messy. In real use you'd parse JSON inside <script> tags.
-        # Here we simulate with empty results to avoid breaking app.
-        comps = []  # TODO: parse if you want real Zillow comps
-        return comps
-    except Exception as e:
-        st.error(f"Zillow fetch error: {e}")
         return []
 
 # ========== VISUALS ==========
@@ -56,14 +43,13 @@ def plot_price_chart(subject_price, comps):
     ax.set_ylabel("List Price ($)")
     ax.tick_params(axis='x', rotation=20)
 
-    # Add labels
     for bar, price in zip(bars, prices):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
                 f"${price/1000:.0f}k", ha='center', va='bottom', fontsize=8)
 
-    # Legend BELOW chart
     fig.subplots_adjust(bottom=0.25)
-    ax.legend(["Subject Property", "Comparable Properties"], loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=2)
+    ax.legend(["Subject Property", "Comparable Properties"], 
+              loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=2)
 
     return fig
 
@@ -78,41 +64,33 @@ def plot_dom_chart(subject_dom, comps):
     ax.set_ylabel("Days on Market")
     ax.tick_params(axis='x', rotation=20)
 
-    # Add labels
     for bar, dom in zip(bars, doms):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
                 f"{dom}", ha='center', va='bottom', fontsize=8)
 
-    # Legend BELOW chart
     fig.subplots_adjust(bottom=0.25)
-    ax.legend(["Subject Property", "Comparable Properties"], loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=2)
+    ax.legend(["Subject Property", "Comparable Properties"], 
+              loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=2)
 
     return fig
 
 # ========== STREAMLIT APP ==========
 
-st.title("🏠 Builder Property Risk Analysis")
+st.title("🏠 Builder Property Risk Analysis (Realtor.com API)")
 
-address = st.text_input("Enter Property Address:")
+address = st.text_input("Enter Property Address or Zip:")
 subject_price = st.number_input("Enter Subject Property Price ($)", min_value=0, step=1000)
 subject_dom = st.number_input("Enter Subject Property DOM (Days on Market)", min_value=0, step=1)
 
 if st.button("Run Analysis") and address:
-    realtor_data = fetch_comps_realtor(address, REALTOR_API_KEY)
-    zillow_data = fetch_comps_zillow(address, SCRAPER_API_KEY)
-
-    comps = realtor_data + zillow_data
+    comps = fetch_comps_realtor(address, REALTOR_API_KEY)
 
     if comps:
-        # Pricing Chart
         st.pyplot(plot_price_chart(subject_price, comps))
-
-        # DOM Chart
         st.pyplot(plot_dom_chart(subject_dom, comps))
 
-        # Simple Risk Score
         avg_price = sum(c["price"] for c in comps if c["price"]) / max(1, len([c for c in comps if c["price"]]))
         risk_score = 10 - min(10, abs(subject_price - avg_price) / avg_price * 10)
         st.subheader(f"📊 Risk Score: {risk_score:.1f}/10")
     else:
-        st.warning("No comps found. Try another address.")
+        st.warning("No comps found. Try another location.")
