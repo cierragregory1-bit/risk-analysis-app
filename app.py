@@ -1,96 +1,80 @@
 import streamlit as st
-import requests
+import pandas as pd
 import matplotlib.pyplot as plt
 
-# ========== SETTINGS ==========
-REALTOR_API_KEY = "YOUR_RAPIDAPI_KEY"
+st.set_page_config(page_title="Builder Property Risk Analysis", layout="wide")
 
-# ========== DATA FETCHER ==========
+st.title("🏡 Builder Property Risk Analysis (Manual Input)")
 
-def fetch_comps_realtor(address, api_key):
-    url = "https://realtor-com-real-estate.p.rapidapi.com/properties/v2/list-for-sale"
-    querystring = {"location": address, "limit": 5}  # grab 5 comps
-    headers = {
-        "x-rapidapi-host": "realtor-com-real-estate.p.rapidapi.com",
-        "x-rapidapi-key": api_key
-    }
-    try:
-        response = requests.get(url, headers=headers, params=querystring, timeout=10)
-        response.raise_for_status()
-        data = response.json().get("properties", [])
-        comps = []
-        for item in data:
-            comps.append({
-                "address": item.get("address", {}).get("line", "Unknown")[:25],  # shorten address
-                "price": item.get("price", 0),
-                "dom": item.get("days_on_market", 0)
-            })
-        return comps
-    except Exception as e:
-        st.error(f"Realtor API error: {e}")
-        return []
+# --- Subject Property Info ---
+st.subheader("Subject Property")
+subject_address = st.text_input("Enter Subject Property Address or Zip:")
+subject_price = st.number_input("Enter Subject Property Price ($)", min_value=0, value=300000, step=1000)
+subject_dom = st.number_input("Enter Subject Property DOM (Days on Market)", min_value=0, value=0, step=1)
 
-# ========== VISUALS ==========
+# --- Manual Comparable Properties Input ---
+st.subheader("Comparable Properties (Manual Entry)")
+num_comps = st.number_input("How many comps do you want to enter?", min_value=1, max_value=10, value=3, step=1)
 
-def plot_price_chart(subject_price, comps):
-    fig, ax = plt.subplots()
-    labels = ["Subject Property"] + [c["address"] for c in comps]
-    prices = [subject_price] + [c["price"] for c in comps]
-    colors = ["red"] + ["steelblue"] * len(comps)
+comps = []
+for i in range(num_comps):
+    st.markdown(f"**Comp {i+1}**")
+    address = st.text_input(f"Comp {i+1} Address", key=f"addr_{i}")
+    price = st.number_input(f"Comp {i+1} Price ($)", min_value=0, value=0, step=1000, key=f"price_{i}")
+    dom = st.number_input(f"Comp {i+1} DOM (Days on Market)", min_value=0, value=0, step=1, key=f"dom_{i}")
+    comps.append({"Address": address, "Price": price, "DOM": dom})
 
-    bars = ax.bar(labels, prices, color=colors)
-    ax.set_title("Pricing vs Comps")
-    ax.set_ylabel("List Price ($)")
-    ax.tick_params(axis='x', rotation=20)
+# --- Run Analysis Button ---
+if st.button("Run Analysis"):
+    comp_df = pd.DataFrame(comps)
 
-    for bar, price in zip(bars, prices):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
-                f"${price/1000:.0f}k", ha='center', va='bottom', fontsize=8)
+    if subject_address and subject_price > 0 and not comp_df.empty:
+        # Add subject property row for charts
+        subject_df = pd.DataFrame([{
+            "Address": subject_address + " (Subject)",
+            "Price": subject_price,
+            "DOM": subject_dom
+        }])
+        all_df = pd.concat([subject_df, comp_df], ignore_index=True)
 
-    fig.subplots_adjust(bottom=0.25)
-    ax.legend(["Subject Property", "Comparable Properties"], 
-              loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=2)
+        # --- Pricing vs Comps Chart ---
+        fig1, ax1 = plt.subplots()
+        ax1.bar(all_df["Address"], all_df["Price"],
+                color=["red"] + ["steelblue"]*(len(all_df)-1))
+        ax1.set_title("Pricing vs Comps")
+        ax1.set_ylabel("List Price ($)")
+        for idx, val in enumerate(all_df["Price"]):
+            ax1.text(idx, val + 1000, f"${val:,.0f}", ha="center", va="bottom")
+        plt.xticks(rotation=20, ha="right")
+        st.pyplot(fig1)
 
-    return fig
+        # --- DOM Pressure Chart ---
+        fig2, ax2 = plt.subplots()
+        ax2.bar(all_df["Address"], all_df["DOM"],
+                color=["orange"] + ["steelblue"]*(len(all_df)-1))
+        ax2.set_title("DOM Pressure")
+        ax2.set_ylabel("Days on Market")
+        for idx, val in enumerate(all_df["DOM"]):
+            ax2.text(idx, val + 1, f"{val}", ha="center", va="bottom")
+        plt.xticks(rotation=20, ha="right")
+        st.pyplot(fig2)
 
-def plot_dom_chart(subject_dom, comps):
-    fig, ax = plt.subplots()
-    labels = ["Subject Property"] + [c["address"] for c in comps]
-    doms = [subject_dom] + [c["dom"] for c in comps]
-    colors = ["orange"] + ["steelblue"] * len(comps)
+        # --- Risk Score Calculation ---
+        avg_price = comp_df["Price"].mean()
+        avg_dom = comp_df["DOM"].mean()
 
-    bars = ax.bar(labels, doms, color=colors)
-    ax.set_title("DOM Pressure")
-    ax.set_ylabel("Days on Market")
-    ax.tick_params(axis='x', rotation=20)
+        price_score = max(0, 10 - abs(subject_price - avg_price) / avg_price * 10)
+        dom_score = max(0, 10 - abs(subject_dom - avg_dom) / avg_dom * 10) if avg_dom > 0 else 10
+        buyer_pool_score = max(0, min(10, len(comps) * 2))  # crude proxy
+        overall_score = round((price_score + dom_score + buyer_pool_score) / 3, 1)
 
-    for bar, dom in zip(bars, doms):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
-                f"{dom}", ha='center', va='bottom', fontsize=8)
+        st.subheader("📊 Risk Scores (0-10)")
+        st.markdown(
+            f"**Pricing:** {round(price_score,1)} | "
+            f"**DOM:** {round(dom_score,1)} | "
+            f"**Buyer Pool:** {round(buyer_pool_score,1)} | "
+            f"**Overall:** **{overall_score}**"
+        )
 
-    fig.subplots_adjust(bottom=0.25)
-    ax.legend(["Subject Property", "Comparable Properties"], 
-              loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=2)
-
-    return fig
-
-# ========== STREAMLIT APP ==========
-
-st.title("🏠 Builder Property Risk Analysis (Realtor.com API)")
-
-address = st.text_input("Enter Property Address or Zip:")
-subject_price = st.number_input("Enter Subject Property Price ($)", min_value=0, step=1000)
-subject_dom = st.number_input("Enter Subject Property DOM (Days on Market)", min_value=0, step=1)
-
-if st.button("Run Analysis") and address:
-    comps = fetch_comps_realtor(address, REALTOR_API_KEY)
-
-    if comps:
-        st.pyplot(plot_price_chart(subject_price, comps))
-        st.pyplot(plot_dom_chart(subject_dom, comps))
-
-        avg_price = sum(c["price"] for c in comps if c["price"]) / max(1, len([c for c in comps if c["price"]]))
-        risk_score = 10 - min(10, abs(subject_price - avg_price) / avg_price * 10)
-        st.subheader(f"📊 Risk Score: {risk_score:.1f}/10")
     else:
-        st.warning("No comps found. Try another location.")
+        st.error("Please fill out subject property and comps before running analysis.")
