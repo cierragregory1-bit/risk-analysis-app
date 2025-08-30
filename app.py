@@ -1,99 +1,118 @@
 import streamlit as st
-import pandas as pd
+import requests
 import matplotlib.pyplot as plt
-import seaborn as sns
 
-# -----------------------------
-# Page Setup
-# -----------------------------
-st.set_page_config(page_title="Property Risk Analysis", layout="wide")
+# ========== SETTINGS ==========
+REALTOR_API_KEY = "YOUR_RAPIDAPI_KEY"
+SCRAPER_API_KEY = "YOUR_SCRAPERAPI_KEY"
 
-st.title("🏠 Property Risk Analysis Tool")
-st.markdown("Upload property and comparable data to generate risk analytics.")
+# ========== DATA FETCHERS ==========
 
-# -----------------------------
-# File Upload
-# -----------------------------
-uploaded_file = st.file_uploader("Upload your property data (CSV)", type=["csv"])
+def fetch_comps_realtor(address, api_key):
+    url = "https://realtor-com-real-estate.p.rapidapi.com/properties/v2/list-for-sale"
+    querystring = {"location": address, "limit": 5}  # pull 5 comps
+    headers = {
+        "x-rapidapi-host": "realtor-com-real-estate.p.rapidapi.com",
+        "x-rapidapi-key": api_key
+    }
+    try:
+        response = requests.get(url, headers=headers, params=querystring, timeout=10)
+        data = response.json().get("properties", [])
+        comps = []
+        for item in data:
+            comps.append({
+                "address": item.get("address", {}).get("line", "Unknown")[:25],  # shorten address
+                "price": item.get("price", 0),
+                "dom": item.get("days_on_market", 0)
+            })
+        return comps
+    except Exception as e:
+        st.error(f"Realtor API error: {e}")
+        return []
 
-if uploaded_file is not None:
-    df = pd.read_csv(uploaded_file)
+def fetch_comps_zillow(address, scraper_api_key):
+    # Scrape Zillow results using ScraperAPI (basic HTML parse)
+    url = f"http://api.scraperapi.com?api_key={scraper_api_key}&url=https://www.zillow.com/homes/{address}"
+    try:
+        response = requests.get(url, timeout=15)
+        # NOTE: Zillow's HTML is messy. In real use you'd parse JSON inside <script> tags.
+        # Here we simulate with empty results to avoid breaking app.
+        comps = []  # TODO: parse if you want real Zillow comps
+        return comps
+    except Exception as e:
+        st.error(f"Zillow fetch error: {e}")
+        return []
 
-    # Make a short address for charts (street + city only)
-    def shorten_address(addr):
-        parts = addr.split(",")
-        return ", ".join(parts[:2]) if len(parts) >= 2 else addr
+# ========== VISUALS ==========
 
-    df["short_address"] = df["address"].apply(shorten_address)
+def plot_price_chart(subject_price, comps):
+    fig, ax = plt.subplots()
+    labels = ["Subject Property"] + [c["address"] for c in comps]
+    prices = [subject_price] + [c["price"] for c in comps]
+    colors = ["red"] + ["steelblue"] * len(comps)
 
-    # -----------------------------
-    # Subject Property (first row)
-    # -----------------------------
-    subject = df.iloc[0]
-    comps = df.iloc[1:]
+    bars = ax.bar(labels, prices, color=colors)
+    ax.set_title("Pricing vs Comps")
+    ax.set_ylabel("List Price ($)")
+    ax.tick_params(axis='x', rotation=20)
 
-    st.subheader("📌 Subject Property")
-    st.write(subject)
+    # Add labels
+    for bar, price in zip(bars, prices):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                f"${price/1000:.0f}k", ha='center', va='bottom', fontsize=8)
 
-    # -----------------------------
-    # Risk Score Calculation
-    # -----------------------------
-    def calculate_risk(subject, comps):
-        pricing_score = max(0, 10 - abs(subject["price"] - comps["price"].mean()) / 10000)
-        dom_score = max(0, 10 - abs(subject["dom"] - comps["dom"].mean()) / 5)
-        pool_score = min(10, len(comps) / 2)
-        overall = round((pricing_score + dom_score + pool_score) / 3, 1)
-        return pricing_score, dom_score, pool_score, overall
+    # Legend BELOW chart
+    fig.subplots_adjust(bottom=0.25)
+    ax.legend(["Subject Property", "Comparable Properties"], loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=2)
 
-    pricing, dom, pool, overall = calculate_risk(subject, comps)
+    return fig
 
-    st.subheader("📊 Risk Scores")
-    st.markdown(
-        f"**Pricing:** {round(pricing,1)} | "
-        f"**DOM:** {round(dom,1)} | "
-        f"**Buyer Pool:** {round(pool,1)} | "
-        f"**Overall:** {overall}"
-    )
+def plot_dom_chart(subject_dom, comps):
+    fig, ax = plt.subplots()
+    labels = ["Subject Property"] + [c["address"] for c in comps]
+    doms = [subject_dom] + [c["dom"] for c in comps]
+    colors = ["orange"] + ["steelblue"] * len(comps)
 
-    # -----------------------------
-    # Charts
-    # -----------------------------
-    col1, col2 = st.columns(2)
+    bars = ax.bar(labels, doms, color=colors)
+    ax.set_title("DOM Pressure")
+    ax.set_ylabel("Days on Market")
+    ax.tick_params(axis='x', rotation=20)
 
-    # Pricing vs Comps
-    with col1:
-        st.markdown("### Pricing vs Comps")
-        plt.figure(figsize=(6, 4))
-        sns.barplot(x="short_address", y="price", data=comps, color="steelblue", label="Comparable Properties")
-        plt.bar(subject["short_address"], subject["price"], color="firebrick", label="Subject Property")
-        plt.ylabel("List Price ($)")
-        plt.xticks(rotation=30, ha="right", fontsize=8)
-        plt.legend()
-        plt.tight_layout()
-        st.pyplot(plt.gcf())
+    # Add labels
+    for bar, dom in zip(bars, doms):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                f"{dom}", ha='center', va='bottom', fontsize=8)
 
-    # DOM Pressure
-    with col2:
-        st.markdown("### DOM Pressure")
-        plt.figure(figsize=(6, 4))
-        sns.barplot(x="short_address", y="dom", data=comps, color="steelblue", label="Comparable Properties")
-        plt.bar(subject["short_address"], subject["dom"], color="darkorange", label="Subject Property")
-        plt.ylabel("Days on Market")
-        plt.xticks(rotation=30, ha="right", fontsize=8)
-        plt.legend()
-        plt.tight_layout()
-        st.pyplot(plt.gcf())
+    # Legend BELOW chart
+    fig.subplots_adjust(bottom=0.25)
+    ax.legend(["Subject Property", "Comparable Properties"], loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=2)
 
-    # -----------------------------
-    # Recommended List-Price Band
-    # -----------------------------
-    avg_comp_price = comps["price"].mean()
-    low_band = avg_comp_price * 0.97
-    high_band = avg_comp_price * 1.03
+    return fig
 
-    st.subheader("💡 Recommended List-Price Band")
-    st.write(f"${low_band:,.0f} – ${high_band:,.0f}")
+# ========== STREAMLIT APP ==========
 
-else:
-    st.info("👆 Upload a CSV to begin. First row = Subject Property, rest = Comps")
+st.title("🏠 Builder Property Risk Analysis")
 
+address = st.text_input("Enter Property Address:")
+subject_price = st.number_input("Enter Subject Property Price ($)", min_value=0, step=1000)
+subject_dom = st.number_input("Enter Subject Property DOM (Days on Market)", min_value=0, step=1)
+
+if st.button("Run Analysis") and address:
+    realtor_data = fetch_comps_realtor(address, REALTOR_API_KEY)
+    zillow_data = fetch_comps_zillow(address, SCRAPER_API_KEY)
+
+    comps = realtor_data + zillow_data
+
+    if comps:
+        # Pricing Chart
+        st.pyplot(plot_price_chart(subject_price, comps))
+
+        # DOM Chart
+        st.pyplot(plot_dom_chart(subject_dom, comps))
+
+        # Simple Risk Score
+        avg_price = sum(c["price"] for c in comps if c["price"]) / max(1, len([c for c in comps if c["price"]]))
+        risk_score = 10 - min(10, abs(subject_price - avg_price) / avg_price * 10)
+        st.subheader(f"📊 Risk Score: {risk_score:.1f}/10")
+    else:
+        st.warning("No comps found. Try another address.")
