@@ -1,216 +1,175 @@
 import streamlit as st
+import requests
+import pandas as pd
 import matplotlib.pyplot as plt
 from fpdf import FPDF
 import tempfile
 import os
 
-# --- App Config ---
-st.set_page_config(page_title="Builder Property Risk Analysis", layout="wide")
-st.title("🏡 Builder Property Risk Analysis")
+# RentCast API Key (yours)
+API_KEY = "92b00e990823456eba2d61ffc2f3f224"
 
-# --- Sidebar Inputs ---
-st.sidebar.header("Enter Property Details")
-subject_address = st.sidebar.text_input("Enter Property Address or Zip:")
-subject_price = st.sidebar.number_input("Enter Subject Property Price ($)", min_value=0, step=1000)
-subject_dom = st.sidebar.number_input("Enter Subject Property DOM (Days on Market)", min_value=0, step=1)
+st.set_page_config(page_title="Builder Risk Analysis", layout="wide")
 
-comp1_price = st.sidebar.number_input("Comp 1 Price ($)", min_value=0, step=1000)
-comp1_dom = st.sidebar.number_input("Comp 1 DOM", min_value=0, step=1)
+st.title("🏠 Builder Property Risk Analysis (with PDF Export)")
 
-comp2_price = st.sidebar.number_input("Comp 2 Price ($)", min_value=0, step=1000)
-comp2_dom = st.sidebar.number_input("Comp 2 DOM", min_value=0, step=1)
+# User inputs
+address = st.text_input("Enter Property Address", "2457 Farm to Market #1653 Ben Wheeler TX 75754")
+subject_price = st.number_input("Enter Subject Property Price ($)", value=350000)
+subject_dom = st.number_input("Enter Subject Property DOM (Days on Market)", value=30)
 
-comp3_price = st.sidebar.number_input("Comp 3 Price ($)", min_value=0, step=1000)
-comp3_dom = st.sidebar.number_input("Comp 3 DOM", min_value=0, step=1)
+if st.button("Run Analysis"):
+    # RentCast API request
+    url = "https://api.rentcast.io/v1/properties/comps"
+    headers = {"accept": "application/json", "X-Api-Key": API_KEY}
+    params = {"address": address, "limit": 3}
 
-# --- Run Analysis ---
-if st.sidebar.button("Run Analysis"):
+    response = requests.get(url, headers=headers, params=params)
 
-    # --- Data Prep ---
-    comp_prices = [comp1_price, comp2_price, comp3_price]
-    comp_doms = [comp1_dom, comp2_dom, comp3_dom]
+    if response.status_code == 200:
+        comps = response.json()
 
-    avg_comp_price = sum(comp_prices) / len([p for p in comp_prices if p > 0]) if any(comp_prices) else 0
-    avg_comp_dom = sum(comp_doms) / len([d for d in comp_doms if d > 0]) if any(comp_doms) else 0
+        if comps:
+            df = pd.DataFrame(comps)
 
-    # --- Risk Scoring ---
-    price_score = max(0, 10 - abs(subject_price - avg_comp_price) / (0.1 * avg_comp_price)) if avg_comp_price else 5
-    dom_score = max(0, 10 - abs(subject_dom - avg_comp_dom) / (0.1 * avg_comp_dom)) if avg_comp_dom else 5
-    buyer_pool_score = (price_score + dom_score) / 2
-    overall_score = (price_score + dom_score + buyer_pool_score) / 3
+            # Display comps table
+            st.subheader("Comparable Properties")
+            st.dataframe(df[["formattedAddress", "price", "daysOnMarket"]])
 
-    # --- Risk Category ---
-    if overall_score >= 7.5:
-        risk_category = "Low Risk ✅"
-        bg_color = "#d4edda"  # light green
-    elif overall_score >= 5:
-        risk_category = "Moderate Risk ⚠️"
-        bg_color = "#fff3cd"  # soft yellow
-    else:
-        risk_category = "High Risk 🚨"
-        bg_color = "#f8d7da"  # light red
+            # --- Risk Analysis Logic ---
+            avg_price = df["price"].mean()
+            avg_dom = df["daysOnMarket"].mean()
 
-    # --- Risk Classification Box ---
-    st.markdown(
-        f"<div style='background-color:{bg_color}; padding:20px; border-radius:12px'>"
-        f"<h3>📊 Risk Analysis</h3>"
-        f"<b>Pricing:</b> {price_score:.1f} | "
-        f"<b>DOM:</b> {dom_score:.1f} | "
-        f"<b>Buyer Pool:</b> {buyer_pool_score:.1f} | "
-        f"<b>Overall:</b> {overall_score:.1f} → <b>{risk_category}</b>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
+            price_diff = (subject_price - avg_price) / avg_price * 100 if avg_price else 0
+            dom_diff = subject_dom - avg_dom if avg_dom else subject_dom
 
-    # --- Progress Bar for Overall Score ---
-    st.progress(min(int(overall_score * 10), 100))
+            probability = 60
+            if price_diff > 10:
+                probability -= 20
+            elif price_diff < -5:
+                probability += 10
 
-    st.divider()
+            if dom_diff > 15:
+                probability -= 15
+            elif dom_diff < -10:
+                probability += 5
 
-    # --- Charts ---
-    st.subheader("📈 Market Comparison Charts")
-    col1, col2 = st.columns(2)
+            probability = max(5, min(probability, 95))
 
-    with col1:
-        fig, ax = plt.subplots()
-        bars = ax.bar(
-            ["Subject"] + [f"Comp {i+1}" for i in range(3)],
-            [subject_price, comp1_price, comp2_price, comp3_price],
-            color=["#ff6b6b", "#4a90e2", "#4a90e2", "#4a90e2"]
-        )
-        ax.set_ylabel("List Price ($)")
-        ax.set_title("Pricing vs Comps")
-        ax.bar_label(bars, labels=[f"${val/1000:.0f}k" if val > 0 else "" for val in bars.datavalues], padding=3)
-        st.pyplot(fig)
+            if probability >= 70:
+                category, color = "Low Risk", "#90EE90"
+            elif 40 <= probability < 70:
+                category, color = "Moderate Risk", "#FFD580"
+            else:
+                category, color = "High Risk", "#FF7F7F"
 
-    with col2:
-        fig, ax = plt.subplots()
-        bars = ax.bar(
-            ["Subject"] + [f"Comp {i+1}" for i in range(3)],
-            [subject_dom, comp1_dom, comp2_dom, comp3_dom],
-            color=["#ffa94d", "#4a90e2", "#4a90e2", "#4a90e2"]
-        )
-        ax.set_ylabel("Days on Market")
-        ax.set_title("DOM Pressure")
-        ax.bar_label(bars, labels=[f"{val}" if val > 0 else "" for val in bars.datavalues], padding=3)
-        st.pyplot(fig)
-
-    st.divider()
-
-    # --- Reasoning ---
-    st.subheader("🧐 Reasoning for Risk Classification")
-    reasoning = []
-    if price_score < 6:
-        reasoning.append("The subject property’s price is significantly higher/lower than comparable properties.")
-    else:
-        reasoning.append("The subject property’s price is aligned with market comps.")
-    if dom_score < 6:
-        reasoning.append("Days on Market indicates slower movement compared to comps.")
-    else:
-        reasoning.append("Days on Market trend is competitive with the area.")
-    if buyer_pool_score < 6:
-        reasoning.append("Limited buyer pool may reduce demand.")
-    else:
-        reasoning.append("Buyer pool demand is strong relative to comps.")
-    st.write(" ".join(reasoning))
-
-    st.divider()
-
-    # --- Contingency Contract Suggestions ---
-    st.subheader("📑 Contingency Contract Suggestions")
-    contract_suggestions = []
-    if price_score < 6:
-        contract_suggestions.append("💲 Include appraisal contingency or price adjustment clause.")
-    if dom_score < 6:
-        contract_suggestions.append("⚡ Offer seller concessions or interest rate buy-downs.")
-    if buyer_pool_score < 6:
-        contract_suggestions.append("🎯 Target marketing toward niche buyers or provide repair credits.")
-    if not contract_suggestions:
-        contract_suggestions.append("✅ Property is well-positioned; standard contract terms apply.")
-    for s in contract_suggestions:
-        st.markdown(f"- {s}")
-
-    st.divider()
-
-    # --- Probability of Sale in 60 Days ---
-    st.subheader("📊 Probability of Sale in 60 Days")
-    if overall_score >= 7.5:
-        prob_sale = 0.85
-    elif overall_score >= 5:
-        prob_sale = 0.65
-    else:
-        prob_sale = 0.35
-
-    st.write(f"Estimated Probability of Sale in 60 days: **{int(prob_sale*100)}%**")
-    st.progress(int(prob_sale * 100))
-
-    st.divider()
-
-    # --- Export to PDF Button ---
-    if st.button("📄 Download Risk Report (PDF)"):
-
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Arial", "B", 16)
-        pdf.cell(200, 10, "Builder Property Risk Analysis Report", ln=True, align="C")
-        pdf.ln(10)
-
-        # Property Details
-        pdf.set_font("Arial", "", 12)
-        pdf.cell(200, 10, f"Property: {subject_address}", ln=True)
-        pdf.cell(200, 10, f"List Price: ${subject_price:,.0f}", ln=True)
-        pdf.cell(200, 10, f"Days on Market: {subject_dom}", ln=True)
-        pdf.ln(5)
-
-        # Risk Summary
-        pdf.set_font("Arial", "B", 12)
-        pdf.cell(200, 10, "Risk Classification", ln=True)
-        pdf.set_font("Arial", "", 12)
-        pdf.multi_cell(200, 8,
-            f"Pricing Score: {price_score:.1f}\n"
-            f"DOM Score: {dom_score:.1f}\n"
-            f"Buyer Pool Score: {buyer_pool_score:.1f}\n"
-            f"Overall: {overall_score:.1f} → {risk_category}"
-        )
-        pdf.ln(5)
-
-        # Probability
-        pdf.set_font("Arial", "B", 12)
-        pdf.cell(200, 10, "Probability of Sale in 60 Days", ln=True)
-        pdf.set_font("Arial", "", 12)
-        pdf.cell(200, 10, f"Estimated: {int(prob_sale*100)}%", ln=True)
-        pdf.ln(5)
-
-        # Reasoning
-        pdf.set_font("Arial", "B", 12)
-        pdf.cell(200, 10, "Reasoning", ln=True)
-        pdf.set_font("Arial", "", 12)
-        for r in reasoning:
-            pdf.multi_cell(200, 8, f"- {r}")
-        pdf.ln(5)
-
-        # Suggestions
-        pdf.set_font("Arial", "B", 12)
-        pdf.cell(200, 10, "Contingency Contract Suggestions", ln=True)
-        pdf.set_font("Arial", "", 12)
-        for s in contract_suggestions:
-            pdf.multi_cell(200, 8, f"- {s}")
-        pdf.ln(5)
-
-        # Save PDF Temp File
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-            pdf.output(tmp_file.name)
-            tmp_path = tmp_file.name
-
-        with open(tmp_path, "rb") as file:
-            st.download_button(
-                label="⬇️ Save PDF Report",
-                data=file,
-                file_name=f"Risk_Report_{subject_address.replace(' ', '_')}.pdf",
-                mime="application/pdf",
+            # --- Display Risk Analysis ---
+            st.subheader("📊 Risk Analysis Summary")
+            st.markdown(
+                f"""
+                <div style="padding:15px; border-radius:10px; background-color:{color}">
+                    <h3 style="margin:0;">Risk Classification: {category}</h3>
+                    <p style="margin:0;">Probability of Sale in 60 Days: <b>{probability}%</b></p>
+                </div>
+                """,
+                unsafe_allow_html=True
             )
 
-        os.remove(tmp_path)
+            # Reasoning
+            st.markdown("### 🧐 Reasoning for Classification")
+            reasoning = []
+            if price_diff > 10:
+                reasoning.append(f"- Property is priced **{price_diff:.1f}% above** average comps.")
+            elif price_diff < -5:
+                reasoning.append(f"- Property is priced **{abs(price_diff):.1f}% below** average comps (competitive).")
+            else:
+                reasoning.append("- Property pricing is roughly in line with comps.")
+
+            if dom_diff > 15:
+                reasoning.append(f"- Subject property DOM is **{dom_diff:.0f} days longer** than average comps.")
+            elif dom_diff < -10:
+                reasoning.append(f"- Subject property DOM is moving faster than comps by **{abs(dom_diff):.0f} days**.")
+            else:
+                reasoning.append("- Subject DOM is similar to comps.")
+
+            for r in reasoning:
+                st.write(r)
+
+            # Contingency contract suggestions
+            st.markdown("### 📝 Contingency Contract Suggestions")
+            contract_suggestions = [
+                "Require property to be listed within **30 days** of contract signing.",
+                "If no contract within **60 days**, allow builder to seek backup offers.",
+                "Price reductions should follow comp trends if DOM exceeds local average.",
+                "Include option to switch to lease or rental if stagnant beyond 90 days."
+            ]
+            for c in contract_suggestions:
+                st.write(c)
+
+            # --- Charts ---
+            st.markdown("### 📈 Visual Breakdown")
+
+            fig, ax = plt.subplots()
+            labels = ["Subject Property"] + df["formattedAddress"].tolist()
+            prices = [subject_price] + df["price"].tolist()
+            ax.bar(labels, prices, color=["red"] + ["blue"]*len(df))
+            ax.set_ylabel("List Price ($)")
+            ax.set_title("Pricing vs Comps")
+            plt.xticks(rotation=20, ha="right")
+            st.pyplot(fig)
+
+            fig2, ax2 = plt.subplots()
+            doms = [subject_dom] + df["daysOnMarket"].tolist()
+            ax2.bar(labels, doms, color=["orange"] + ["blue"]*len(df))
+            ax2.set_ylabel("Days on Market")
+            ax2.set_title("DOM Pressure")
+            plt.xticks(rotation=20, ha="right")
+            st.pyplot(fig2)
+
+            # --- PDF Export ---
+            def create_pdf():
+                pdf = FPDF()
+                pdf.add_page()
+                pdf.set_font("Arial", size=12)
+
+                pdf.cell(200, 10, txt="Builder Property Risk Analysis", ln=True, align="C")
+                pdf.ln(10)
+
+                pdf.multi_cell(0, 10, f"Address: {address}")
+                pdf.multi_cell(0, 10, f"Subject Price: ${subject_price:,.0f}")
+                pdf.multi_cell(0, 10, f"Subject DOM: {subject_dom} days")
+                pdf.ln(5)
+
+                pdf.set_fill_color(255, 220, 220 if category == "High Risk" else 255, 255)
+                pdf.multi_cell(0, 10, f"Risk Classification: {category}", fill=True)
+                pdf.multi_cell(0, 10, f"Probability of Sale in 60 Days: {probability}%")
+                pdf.ln(5)
+
+                pdf.multi_cell(0, 10, "Reasoning:")
+                for r in reasoning:
+                    pdf.multi_cell(0, 8, r)
+
+                pdf.ln(5)
+                pdf.multi_cell(0, 10, "Contingency Contract Suggestions:")
+                for c in contract_suggestions:
+                    pdf.multi_cell(0, 8, c)
+
+                # Save to temp file
+                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+                pdf.output(tmp_file.name)
+                return tmp_file.name
+
+            pdf_file = create_pdf()
+            with open(pdf_file, "rb") as f:
+                st.download_button("📥 Download Full Risk Analysis PDF", f, file_name="risk_analysis.pdf")
+
+            os.remove(pdf_file)
+
+        else:
+            st.warning("⚠️ No comps found for this location. Try another address.")
+    else:
+        st.error(f"RentCast API error: {response.status_code} - {response.text}")
+
 
 
 
