@@ -1,6 +1,10 @@
 streamlit
-matplotlib
-pandas
 requests
-fpdf
+pandas
+numpy
+matplotlib
+fpdf2
+Pillow
+
+
 
