@@ -2,112 +2,173 @@ import streamlit as st
 import requests
 import matplotlib.pyplot as plt
 from fpdf import FPDF
+import tempfile
 import os
 
-# -----------------------
+# ==============================
 # CONFIG
-# -----------------------
-RENTCAST_API_KEY = "92b00e990823456eba2d61ffc2f3f224"
-HEADERS = {"accept": "application/json", "X-Api-Key": RENTCAST_API_KEY}
-LOGO_PATH = "logo.png"  # Make sure to upload your logo into the repo as logo.png
+# ==============================
+API_KEY = "92b00e990823456eba2d61ffc2f3f224"
+LOGO_PATH = "logo.png"  # <-- put your uploaded logo in the same folder
 
-# -----------------------
-# FUNCTIONS
-# -----------------------
-def get_property_data(address):
-    url = f"https://api.rentcast.io/v1/properties?address={address}"
-    r = requests.get(url, headers=HEADERS)
-    if r.status_code == 200 and r.json():
-        return r.json()[0]
-    return None
+# ==============================
+# RENTCAST API CALL
+# ==============================
+def get_property_and_comps(address):
+    url = "https://api.rentcast.io/v1/properties"
+    headers = {"accept": "application/json", "X-Api-Key": API_KEY}
+    params = {"address": address}
+    res = requests.get(url, headers=headers, params=params)
 
-def get_comps(address):
-    url = f"https://api.rentcast.io/v1/avm/sales?address={address}&radius=1&limit=3"
-    r = requests.get(url, headers=HEADERS)
-    if r.status_code == 200:
-        return r.json().get("comps", [])
-    return []
+    if res.status_code != 200:
+        return None, None
 
-def abbreviate_address(address):
-    replacements = {"Street":"St", "Road":"Rd", "Avenue":"Ave", "Boulevard":"Blvd", "Drive":"Dr", "Lane":"Ln"}
-    for long, short in replacements.items():
-        address = address.replace(long, short)
-    return address
+    data = res.json()
+    if not data:
+        return None, None
 
+    subject = data[0]
+
+    comps_url = "https://api.rentcast.io/v1/properties/comps"
+    comp_params = {"address": address, "limit": 5}
+    comps_res = requests.get(comps_url, headers=headers, params=comp_params)
+    comps = comps_res.json() if comps_res.status_code == 200 else []
+
+    return subject, comps
+
+# ==============================
+# RISK CLASSIFICATION
+# ==============================
 def classify_risk(price, comp_prices, dom, comp_doms):
-    avg_price = sum(comp_prices) / len(comp_prices) if comp_prices else price
-    avg_dom = sum(comp_doms) / len(comp_doms) if comp_doms else dom
+    if not comp_prices or not comp_doms:
+        return {
+            "risk": "Unavailable",
+            "color": "gray",
+            "reason": "No comparable properties found in RentCast for this location.",
+            "probability": "N/A",
+            "suggestions": "Try entering another nearby address or broaden the search area."
+        }
+
+    avg_price = sum(comp_prices) / len(comp_prices) if comp_prices else 0
+    avg_dom = sum(comp_doms) / len(comp_doms) if comp_doms else 0
+
+    if avg_price == 0:
+        return {
+            "risk": "Unavailable",
+            "color": "gray",
+            "reason": "Comparable properties returned no valid pricing data.",
+            "probability": "N/A",
+            "suggestions": "Try another address or check data availability."
+        }
 
     price_diff = abs(price - avg_price) / avg_price
-    dom_diff = dom - avg_dom
+    dom_diff = abs(dom - avg_dom) / avg_dom if avg_dom > 0 else 0
 
-    if price_diff < 0.05 and dom_diff <= 0:
-        risk, color, prob = "Low Risk", "#b7f7a8", 0.85
-        reason = "Price aligns with comps and DOM is competitive."
-        suggestion = "Proceed confidently. Standard contingencies only."
-    elif price_diff < 0.15 and dom_diff <= 30:
-        risk, color, prob = "Moderate Risk", "#fff3a3", 0.65
-        reason = "Price slightly high or DOM slightly longer than comps."
-        suggestion = "Consider inspection/appraisal contingencies. Price adjustment may help."
+    if price_diff < 0.05 and dom_diff < 0.2:
+        return {
+            "risk": "Low",
+            "color": "#4CAF50",  # green
+            "reason": "Price and days on market align closely with comps.",
+            "probability": "High (~80%)",
+            "suggestions": "Proceed with standard terms. Minor concessions may help accelerate movement."
+        }
+    elif price_diff < 0.15 and dom_diff < 0.5:
+        return {
+            "risk": "Moderate",
+            "color": "#FFC107",  # yellow
+            "reason": "Some deviation in price or days on market compared to comps.",
+            "probability": "Medium (~55%)",
+            "suggestions": "Consider pricing flexibility and stronger contingencies."
+        }
     else:
-        risk, color, prob = "High Risk", "#ffb3b3", 0.40
-        reason = "Price significantly above comps or DOM much longer."
-        suggestion = "Negotiate aggressively. Add financing/inspection contingencies."
+        return {
+            "risk": "High",
+            "color": "#F44336",  # red
+            "reason": "Significant mismatch between property pricing/DOM and comps.",
+            "probability": "Low (~30%)",
+            "suggestions": "Recommend contract adjustments, concessions, or price improvements."
+        }
 
-    return {"risk": risk, "color": color, "prob": prob, "reason": reason, "suggestion": suggestion}
-
-def create_pdf(subject, comps, analysis):
+# ==============================
+# PDF GENERATION
+# ==============================
+def generate_pdf(subject, comps, analysis, charts):
     pdf = FPDF()
     pdf.add_page()
 
-    # Add logo at the top
     if os.path.exists(LOGO_PATH):
-        pdf.image(LOGO_PATH, 10, 8, 33)  # x, y, width
+        pdf.image(LOGO_PATH, 10, 8, 33)
 
-    # Title
-    pdf.set_font("Helvetica", "B", 20)
-    pdf.cell(0, 15, "Property Risk Analysis Report", ln=True, align="C")
-    pdf.ln(10)
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(200, 10, "Property Risk Analysis Report", ln=True, align="C")
 
-    # Subject property
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 10, "Subject Property", ln=True)
     pdf.set_font("Helvetica", "", 12)
-    pdf.multi_cell(0, 8, f"{subject.get('formattedAddress', 'N/A')}")
-    pdf.cell(0, 8, f"List Price: ${subject.get('price', 'N/A'):,}", ln=True)
-    pdf.cell(0, 8, f"Days on Market: {subject.get('daysOnMarket', 'N/A')}", ln=True)
-    pdf.ln(5)
+    pdf.cell(200, 10, f"Address: {subject.get('formattedAddress', 'N/A')}", ln=True)
+    pdf.cell(200, 10, f"Price: ${subject.get('price', 'N/A')}", ln=True)
+    pdf.cell(200, 10, f"Days on Market: {subject.get('daysOnMarket', 'N/A')}", ln=True)
 
-    # Comps
     pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 10, "Comparable Properties", ln=True)
+    pdf.cell(200, 10, f"Risk Level: {analysis['risk']}", ln=True)
     pdf.set_font("Helvetica", "", 12)
-    for comp in comps:
-        pdf.multi_cell(0, 8, f"{comp['formattedAddress']} - ${comp['price']:,} - DOM {comp['daysOnMarket']}")
+    pdf.multi_cell(0, 10, f"Reason: {analysis['reason']}")
+    pdf.multi_cell(0, 10, f"Probability of Sale: {analysis['probability']}")
+    pdf.multi_cell(0, 10, f"Suggestions: {analysis['suggestions']}")
 
-    pdf.ln(5)
+    for chart_path in charts:
+        pdf.add_page()
+        pdf.image(chart_path, x=10, y=20, w=180)
 
-    # Risk Analysis
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 10, "Risk Analysis", ln=True)
-    pdf.set_font("Helvetica", "", 12)
-    pdf.multi_cell(0, 8, f"Classification: {analysis['risk']}")
-    pdf.multi_cell(0, 8, f"Probability of Sale in 60 Days: {int(analysis['prob']*100)}%")
-    pdf.multi_cell(0, 8, f"Reasoning: {analysis['reason']}")
-    pdf.multi_cell(0, 8, f"Suggestions: {analysis['suggestion']}")
+    tmpfile = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    pdf.output(tmpfile.name)
+    return tmpfile.name
 
-    return pdf
-
-# -----------------------
+# ==============================
 # STREAMLIT APP
-# -----------------------
-st.title("🏡 Builder Property Risk Analysis (RentCast API)")
+# ==============================
+# Custom CSS for branding
+st.markdown(
+    """
+    <style>
+        .main {
+            background-color: #f9f9f9;
+            font-family: 'Helvetica Neue', sans-serif;
+        }
+        .title {
+            font-size: 32px;
+            font-weight: bold;
+            color: #1E3A8A;
+            text-align: center;
+            margin-bottom: 10px;
+        }
+        .subtitle {
+            font-size: 18px;
+            color: #4B5563;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .risk-card {
+            padding: 15px;
+            border-radius: 10px;
+            color: white;
+            font-weight: bold;
+            margin-top: 15px;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+# Logo + title
+if os.path.exists(LOGO_PATH):
+    st.image(LOGO_PATH, width=80)
+
+st.markdown("<div class='title'>🏡 Builder Property Risk Analysis</div>", unsafe_allow_html=True)
+st.markdown("<div class='subtitle'>Automated insights powered by RentCast</div>", unsafe_allow_html=True)
 
 address = st.text_input("Enter Property Address")
 
 if st.button("Run Analysis") and address:
-    subject = get_property_data(address)
-    comps = get_comps(address)
+    subject, comps = get_property_and_comps(address)
 
     if not subject:
         st.error("No property data found. Try another address.")
@@ -119,41 +180,48 @@ if st.button("Run Analysis") and address:
 
         analysis = classify_risk(subject_price, comp_prices, subject_dom, comp_doms)
 
-        # Risk Box
+        # Styled Risk Card
         st.markdown(
-            f"<div style='background-color:{analysis['color']};padding:15px;border-radius:10px;'>"
-            f"<h3 style='margin:0;'>Risk Classification: {analysis['risk']}</h3>"
-            f"<p><b>Probability of Sale (60 days):</b> {int(analysis['prob']*100)}%</p>"
-            f"<p><b>Reasoning:</b> {analysis['reason']}</p>"
-            f"<p><b>Suggestions:</b> {analysis['suggestion']}</p>"
-            "</div>", unsafe_allow_html=True
+            f"<div class='risk-card' style='background-color:{analysis['color']}'>"
+            f"Risk Level: {analysis['risk']}</div>",
+            unsafe_allow_html=True
         )
+        st.write(f"**Reason:** {analysis['reason']}")
+        st.write(f"**Probability of Sale in 60 Days:** {analysis['probability']}")
+        st.write(f"**Suggestions:** {analysis['suggestions']}")
 
         # Charts
-        if comps:
-            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        charts = []
+        if comp_prices:
+            fig, ax = plt.subplots()
+            labels = ["Subject"] + [c.get("formattedAddress", "Comp")[:20] for c in comps]
+            values = [subject_price] + comp_prices
+            ax.bar(labels, values, color=["red"] + ["blue"]*len(comp_prices))
+            ax.set_title("Pricing vs Comps")
+            plt.xticks(rotation=30, ha="right")
+            tmpfile = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+            plt.savefig(tmpfile.name, bbox_inches="tight")
+            charts.append(tmpfile.name)
+            st.image(tmpfile.name)
 
-            prices = [subject_price] + comp_prices
-            labels = ["Subject"] + [abbreviate_address(c["formattedAddress"]) for c in comps]
-            axes[0].bar(labels, prices, color=["red"] + ["blue"]*len(comp_prices))
-            axes[0].set_title("Pricing vs Comps")
-            axes[0].set_ylabel("Price ($)")
-            axes[0].tick_params(axis='x', rotation=30)
-
-            doms = [subject_dom] + comp_doms
-            axes[1].bar(labels, doms, color=["orange"] + ["blue"]*len(comp_doms))
-            axes[1].set_title("Days on Market vs Comps")
-            axes[1].set_ylabel("Days")
-            axes[1].tick_params(axis='x', rotation=30)
-
-            st.pyplot(fig)
+        if comp_doms:
+            fig, ax = plt.subplots()
+            labels = ["Subject"] + [c.get("formattedAddress", "Comp")[:20] for c in comps]
+            values = [subject_dom] + comp_doms
+            ax.bar(labels, values, color=["orange"] + ["blue"]*len(comp_doms))
+            ax.set_title("Days on Market vs Comps")
+            plt.xticks(rotation=30, ha="right")
+            tmpfile = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+            plt.savefig(tmpfile.name, bbox_inches="tight")
+            charts.append(tmpfile.name)
+            st.image(tmpfile.name)
 
         # PDF Export
-        pdf = create_pdf(subject, comps, analysis)
-        pdf_output = "report.pdf"
-        pdf.output(pdf_output)
-        with open(pdf_output, "rb") as f:
-            st.download_button("📄 Download Full Report", f, file_name="Risk_Analysis_Report.pdf", mime="application/pdf")
+        pdf_file = generate_pdf(subject, comps, analysis, charts)
+        with open(pdf_file, "rb") as f:
+            st.download_button("📄 Download PDF Report", f, file_name="RiskAnalysisReport.pdf")
+
+
 
 
 
