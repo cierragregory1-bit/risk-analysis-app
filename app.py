@@ -1,4 +1,4 @@
-import os, io, re, math, json
+import os, io, re, math
 from datetime import datetime
 
 import streamlit as st
@@ -15,29 +15,25 @@ from PIL import Image
 st.set_page_config(page_title="Contingent Property Risk Analysis", page_icon="🏡", layout="wide")
 
 # =========================
-# Secrets (two Realtor APIs)
+# Secrets (Realtor Search only)
 # =========================
-api_secrets = st.secrets.get("realtor_api", {})
-API_KEY = api_secrets.get("key")
-HOST_SEARCH = api_secrets.get("host_search", "realtor-search.p.rapidapi.com")
-HOST_APIDOJO = api_secrets.get("host_apidojo", "realtor-com-real-estate.p.rapidapi.com")
+api = st.secrets.get("realtor_api", {})
+API_KEY = api.get("key")
+HOST_SEARCH = api.get("host_search", "realtor-search.p.rapidapi.com")
 
 if not API_KEY:
     st.error(
         "❌ API key missing. In **Settings → Secrets**, add:\n\n"
         "```toml\n[realtor_api]\nkey = \"YOUR_RAPIDAPI_KEY\"\n"
-        "host_search = \"realtor-search.p.rapidapi.com\"\n"
-        "host_apidojo = \"realtor-com-real-estate.p.rapidapi.com\"\n```"
+        "host_search = \"realtor-search.p.rapidapi.com\"\n```"
     )
     st.stop()
 
-def h_search():   # headers for 'realtor-search'
+def h_search():
     return {"x-rapidapi-key": API_KEY, "x-rapidapi-host": HOST_SEARCH}
 
-def h_apidojo():  # headers for Apidojo 'realtor-com-real-estate'
-    return {"x-rapidapi-key": API_KEY, "x-rapidapi-host": HOST_APIDOJO}
-
-LOGO_PATH = "logo.png"  # optional
+# Optional logo for PDF
+LOGO_PATH = "logo.png"
 
 # =========================
 # Helpers
@@ -58,7 +54,7 @@ def load_logo():
     try: return Image.open(LOGO_PATH)
     except: return None
 
-def normalize_address(addr):
+def normalize_address(addr: str) -> str:
     if not addr: return ""
     a = addr.strip()
     for token in [" Apt ", " Unit ", " Ste ", " Suite ", "#"]:
@@ -70,39 +66,29 @@ def is_url(s: str) -> bool:
 
 def parse_realtor_url(url: str):
     """
-    Try to pull a displayable address and an optional property_id from typical Realtor URLs.
-    Examples:
-      https://www.realtor.com/realestateandhomes-detail/121-Hidden-Creek-Loop_Weatherford_TX_76087_M12345-67890
-    Return (address_string or None, property_id or None)
+    Pull a USPS-style address guess from a Realtor listing URL.
+    Example:
+      .../1105-Freeman-St_Fort-Worth_TX_76104_M81833-43262
+      -> '1105 Freeman St, Fort Worth, TX 76104'
     """
     try:
-        path = re.sub(r"https?://[^/]+", "", url)  # strip domain
-        # Replace separators with spaces
-        clean = path.replace("-", " ").replace("_", " ").strip("/")
-        # Try to grab the trailing 'M######-######' pattern (Apidojo style)
-        m = re.search(r"M(\d+)-(\d+)", path)
-        property_id = None
-        if m:
-            property_id = f"M{m.group(1)}-{m.group(2)}"
-
-        # Heuristic to reconstruct address-ish text from path segments
-        # We'll pull the part after 'detail/' if present
-        m2 = re.search(r"realestateandhomes-detail/([^/]+)", path)
-        addr_part = m2.group(1) if m2 else None
-        if addr_part:
-            addr_part = addr_part.replace("-", " ").replace("_", " ")
-            # Often contains "Street City State Zip ..." — we’ll return it as-is
-            return addr_part, property_id
-
-        # fallback: try splitting path segments
-        segs = [s for s in clean.split("/") if s]
-        guess = " ".join(segs[-3:]) if segs else None
-        return guess, property_id
+        seg = re.search(r"realestateandhomes-detail/([^/?#]+)", url, flags=re.I)
+        if not seg: return None
+        slug = seg.group(1)
+        slug = slug.split("_M")[0]  # drop the property id tail if present
+        parts = slug.split("_")     # ["1105-Freeman-St", "Fort-Worth", "TX", "76104"]
+        if len(parts) >= 4:
+            street = parts[0].replace("-", " ")
+            city   = parts[1].replace("-", " ")
+            state  = parts[2]
+            zipc   = parts[3]
+            return f"{street}, {city}, {state} {zipc}"
+        return slug.replace("-", " ").replace("_", " ")
     except Exception:
-        return None, None
+        return None
 
 # =========================
-# Geocoding
+# Geocoding: Realtor → OSM → (optional) Google
 # =========================
 def resolve_latlon_realtor(addr, debug):
     url = f"https://{HOST_SEARCH}/properties/auto-complete"
@@ -123,7 +109,7 @@ def resolve_latlon_realtor(addr, debug):
 
 def resolve_latlon_osm(addr, debug):
     url = "https://nominatim.openstreetmap.org/search"
-    params = {"q": addr, "format": "json", "limit": 1, "addressdetails": 1}
+    params = {"q": addr, "format": "jsonv2", "limit": 1, "addressdetails": 1, "countrycodes": "us"}
     headers_nom = {"User-Agent": "contingent-risk-app/1.0 (contact: you@example.com)"}
     r = requests.get(url, params=params, headers=headers_nom, timeout=20)
     debug.append(("OSM nominatim", r.status_code, r.text[:800]))
@@ -134,62 +120,59 @@ def resolve_latlon_osm(addr, debug):
     disp = data[0].get("display_name", addr)
     return lat, lon, disp
 
-def resolve_to_latlon(address_or_url, debug):
-    """
-    Accepts either an address or a Realtor listing URL.
-    If URL:
-      - parse address & property_id
-      - try Apidojo detail by property_id for exact coords
-      - else geocode parsed address (Realtor → OSM)
-    If address: geocode as usual.
-    """
-    if is_url(address_or_url):
-        parsed_addr, prop_id = parse_realtor_url(address_or_url)
-        parsed_addr = normalize_address(parsed_addr or "")
-        # 1) Try detail by property_id (Apidojo)
-        if prop_id:
-            try:
-                url = f"https://{HOST_APIDOJO}/properties/v2/detail"
-                r = requests.get(url, headers=h_apidojo(), params={"property_id": prop_id}, timeout=20)
-                debug.append(("APIDOJO detail", r.status_code, r.text[:800]))
-                if r.status_code == 200:
-                    js = r.json()
-                    p = js.get("properties", [{}])[0] if isinstance(js.get("properties"), list) else js.get("property") or js
-                    a = p.get("address", {}) if isinstance(p.get("address"), dict) else {}
-                    lat = a.get("lat") or p.get("lat")
-                    lon = a.get("lon") or p.get("lon")
-                    disp = (a.get("line") or "") + (", " + a.get("city") if a.get("city") else "")
-                    if lat and lon:
-                        return float(lat), float(lon), disp or parsed_addr
-            except Exception as e:
-                debug.append(("APIDOJO detail exception", 0, str(e)))
-        # 2) If no property coords, geocode parsed address
-        if parsed_addr:
-            lat, lon, disp = resolve_latlon_realtor(parsed_addr, debug)
-            if lat and lon: return lat, lon, disp
-            return resolve_latlon_osm(parsed_addr, debug)
-        return None, None, None
+def resolve_latlon_google(addr, debug):
+    key = st.secrets.get("google", {}).get("geocoding_key")
+    if not key: return None, None, None
+    url = "https://maps.googleapis.com/maps/api/geocode/json"
+    params = {"address": addr, "key": key, "region": "us"}
+    r = requests.get(url, params=params, timeout=15)
+    debug.append(("GOOGLE geocode", r.status_code, r.text[:500]))
+    if r.status_code != 200: return None, None, None
+    js = r.json()
+    if js.get("status") != "OK": return None, None, None
+    res = js["results"][0]
+    loc = res["geometry"]["location"]
+    disp = res.get("formatted_address", addr)
+    return float(loc["lat"]), float(loc["lng"]), disp
 
-    # Not a URL: regular address
-    addr = normalize_address(address_or_url)
+def resolve_to_latlon(address_or_url, debug):
+    s = (address_or_url or "").strip()
+    if not s: return None, None, None
+
+    # If user pasted a Realtor URL, parse a clean address guess
+    if is_url(s):
+        addr_guess = parse_realtor_url(s)
+        if not addr_guess:
+            return None, None, None
+        addr_guess = normalize_address(addr_guess)
+        lat, lon, disp = resolve_latlon_realtor(addr_guess, debug)
+        if lat and lon: return lat, lon, disp
+        lat, lon, disp = resolve_latlon_osm(addr_guess, debug)
+        if lat and lon: return lat, lon, disp
+        return resolve_latlon_google(addr_guess, debug)
+
+    # Plain address
+    addr = normalize_address(s)
     lat, lon, disp = resolve_latlon_realtor(addr, debug)
     if lat and lon: return lat, lon, disp
-    return resolve_latlon_osm(addr, debug)
+    lat, lon, disp = resolve_latlon_osm(addr, debug)
+    if lat and lon: return lat, lon, disp
+    return resolve_latlon_google(addr, debug)
 
 # =========================
-# Comps fetchers
+# Comps (Realtor Search only)
 # =========================
-def comps_nearby_home_values(lat, lon, radius, limit, debug):
-    """realtor-search: /properties/nearby-home-values"""
+def fetch_nearby_values(lat, lon, radius_miles=2.0, limit=25, debug=None):
     try:
         url = f"https://{HOST_SEARCH}/properties/nearby-home-values"
-        params = {"lat": str(lat), "lon": str(lon), "radius": str(radius)}
+        params = {"lat": str(lat), "lon": str(lon), "radius": str(radius_miles)}
         r = requests.get(url, headers=h_search(), params=params, timeout=25)
-        debug.append(("SEARCH nearby-home-values", r.status_code, r.text[:800]))
+        if debug is not None:
+            debug.append(("SEARCH nearby-home-values", r.status_code, r.text[:800]))
         if r.status_code != 200: return []
         js = r.json()
         raw = js.get("data") or js.get("results") or js.get("homes") or js.get("listings") or js.get("properties") or []
-        out = []
+        comps = []
         for it in raw[:limit]:
             price = it.get("price") or it.get("list_price") or it.get("value") or it.get("estimate") or it.get("avm", {}).get("value")
             dom = it.get("days_on_market") or it.get("dom")
@@ -198,46 +181,13 @@ def comps_nearby_home_values(lat, lon, radius, limit, debug):
             city = it.get("address", {}).get("city") or it.get("city") or ""
             addr = ", ".join([p for p in [line, city] if p]) or it.get("address") or ""
             if addr:
-                out.append({"address": addr, "price": float(price) if price else None, "dom": int(dom) if dom else None, "sqft": int(sqft) if sqft else None})
-        return out
-    except Exception as e:
-        debug.append(("SEARCH nearby-home-values exception", 0, str(e)))
+                comps.append({"address": addr, "price": float(price) if price else None, "dom": int(dom) if dom else None, "sqft": int(sqft) if sqft else None})
+        return comps
+    except Exception:
         return []
-
-def comps_apidojo_list_for_sale(lat, lon, radius, limit, debug):
-    """apidojo: /properties/v2/list-for-sale with lat/lon"""
-    try:
-        url = f"https://{HOST_APIDOJO}/properties/v2/list-for-sale"
-        params = {"lat": lat, "lon": lon, "radius": radius, "sort": "relevance", "limit": limit}
-        r = requests.get(url, headers=h_apidojo(), params=params, timeout=25)
-        debug.append(("APIDOJO list-for-sale", r.status_code, r.text[:800]))
-        if r.status_code != 200: return []
-        js = r.json()
-        props = js.get("properties") or []
-        out = []
-        for p in props[:limit]:
-            price = p.get("price")
-            dom = p.get("days_on_market") or p.get("dom")
-            sqft = (p.get("building_size", {}) or {}).get("size") if isinstance(p.get("building_size"), dict) else p.get("building_size")
-            a = p.get("address", {}) if isinstance(p.get("address"), dict) else {}
-            line = a.get("line") or ""
-            city = a.get("city") or ""
-            addr = ", ".join([t for t in [line, city] if t]) or line or city
-            if addr:
-                out.append({"address": addr, "price": float(price) if price else None, "dom": int(dom) if dom else None, "sqft": int(sqft) if sqft else None})
-        return out
-    except Exception as e:
-        debug.append(("APIDOJO list-for-sale exception", 0, str(e)))
-        return []
-
-def fetch_comps(lat, lon, radius, limit, debug):
-    comps = comps_nearby_home_values(lat, lon, radius, limit, debug)
-    if comps: return comps
-    comps = comps_apidojo_list_for_sale(lat, lon, radius, limit, debug)
-    return comps
 
 # =========================
-# Risk & subject proxy
+# Risk model
 # =========================
 def subject_from_comps(comps):
     prices = [c["price"] for c in comps if c["price"]]
@@ -323,10 +273,10 @@ def build_pdf(report):
 # =========================
 # UI
 # =========================
-st.title("🏡 Contingent Property Risk Analysis — Address or Realtor URL")
-st.caption("Paste a full Realtor.com URL *or* type an address. We’ll parse → geocode → pull comps → risk it.")
+st.title("🏡 Contingent Property Risk Analysis — Realtor Search only")
+st.caption("Paste a Realtor URL *or* type a full address. We parse → geocode (Realtor → OSM → optional Google) → pull comps → risk it.")
 
-addr_or_url = st.text_input("Enter Address or Realtor.com URL", placeholder="e.g., https://www.realtor.com/realestateandhomes-detail/...")
+addr_or_url = st.text_input("Enter Address or Realtor.com URL", placeholder="e.g., 1105 Freeman St, Fort Worth, TX 76104 or https://www.realtor.com/realestateandhomes-detail/...")
 with st.expander("If the address can’t be resolved, enter coordinates manually"):
     use_manual = st.checkbox("Use manual latitude/longitude")
     colm1, colm2 = st.columns(2)
@@ -351,17 +301,17 @@ if go:
             lat, lon, disp = resolve_to_latlon(addr_or_url, debug_notes)
 
     if not lat or not lon:
-        st.error("Could not resolve this location from Realtor or fallback geocoder. Try city/state/ZIP, or use manual lat/lon.")
+        st.error("Could not resolve this location from Realtor/OSM (and optional Google). Try full USPS format or manual lat/lon.")
         if show_debug:
             st.subheader("Debug Panel"); st.json(debug_notes)
         st.stop()
 
-    # Fetch comps with dual-API fallback
+    # Fetch comps (Realtor Search only)
     with st.spinner("Fetching comps…"):
-        comps = fetch_comps(lat, lon, radius, limit, debug_notes)
+        comps = fetch_nearby_values(lat, lon, radius_miles=radius, limit=limit, debug=debug_notes)
 
     if not comps:
-        st.warning("No comps returned by either API for this area/radius. Try widening the radius or verify your API subscriptions.")
+        st.warning("No comps returned by Realtor Search for this area/radius. Try widening the radius, another nearby address, or enable a second data source later.")
         if show_debug:
             st.subheader("Debug Panel"); st.json(debug_notes)
         st.stop()
@@ -386,7 +336,69 @@ if go:
     )
 
     # Details
-    c1, c2 = st
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Subject (derived)")
+        st.write(f"**Subject Price (proxy):** {fmt_money(subject_price)}")
+        st.write(f"**Subject DOM (proxy):** {subject_dom if subject_dom is not None else '—'}")
+        if comp_prices: st.write(f"**Comp Median Price:** {fmt_money(safe_median(comp_prices))}")
+        if comp_doms:   st.write(f"**Comp Median DOM:** {int(safe_median(comp_doms))}")
+    with c2:
+        st.subheader("Reasoning")
+        for r in reasons: st.write("• " + r)
+
+    st.subheader("Comparable Properties")
+    df = pd.DataFrame([{
+        "Address": abbreviate(c["address"], 40),
+        "Price": fmt_money(c["price"]),
+        "DOM": c["dom"] if c["dom"] else "—",
+        "SqFt": c["sqft"] if c["sqft"] else "—",
+    } for c in comps])
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.subheader("Visuals")
+    labels = [abbreviate(c["address"], 18) for c in comps[:12]]
+    values = [c["price"] if c["price"] else 0 for c in comps[:12]]
+    # Price chart
+    fig1, ax1 = plt.subplots(figsize=(8, 4))
+    ax1.bar(labels, values, label="Comparable Properties")
+    if subject_price: ax1.axhline(subject_price, color="#e07a5f", linestyle="--", linewidth=2, label="Subject (proxy)")
+    ax1.set_title("Pricing vs Nearby Values (subject proxy dashed)"); ax1.set_ylabel("Price ($)")
+    ax1.legend(loc="upper right"); plt.xticks(rotation=20, ha="right")
+    st.pyplot(fig1)
+
+    # DOM chart
+    if comp_doms:
+        fig2, ax2 = plt.subplots(figsize=(8, 4))
+        dom_vals = [c["dom"] if c["dom"] else 0 for c in comps[:12]]
+        ax2.bar(labels, dom_vals, label="Comparable Properties")
+        if subject_dom: ax2.axhline(subject_dom, color="#e07a5f", linestyle="--", linewidth=2, label="Subject (proxy)")
+        ax2.set_title("Days on Market vs Comps"); ax2.set_ylabel("Days")
+        ax2.legend(loc="upper right"); plt.xticks(rotation=20, ha="right")
+        st.pyplot(fig2)
+
+    st.subheader("Contingency Contract Suggestions")
+    for s in suggestions: st.write("• " + s)
+
+    # PDF
+    st.divider()
+    report = {
+        "subject_address": disp or addr_or_url,
+        "subject_price": subject_price,
+        "subject_dom": subject_dom,
+        "risk_band": band,
+        "probability_60d": prob60,
+        "reasons": reasons,
+        "suggestions": suggestions,
+        "comps": comps,
+    }
+    pdf_bytes = build_pdf(report)
+    st.download_button("📄 Download PDF Report", data=pdf_bytes, file_name="risk_analysis_report.pdf", mime="application/pdf")
+
+    if show_debug:
+        st.subheader("Debug Panel")
+        st.json(debug_notes)
+
 
 
 
