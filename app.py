@@ -1,4 +1,4 @@
-import os, io, re, math
+import os, io, re, math, time
 from datetime import datetime
 
 import streamlit as st
@@ -32,8 +32,30 @@ if not API_KEY:
 def h_search():
     return {"x-rapidapi-key": API_KEY, "x-rapidapi-host": HOST_SEARCH}
 
-# Optional logo for PDF
+# Optional logo for PDF (put a file named 'logo.png' next to app.py)
 LOGO_PATH = "logo.png"
+
+# =========================
+# Debug Sidebar
+# =========================
+st.sidebar.title("Debug")
+st.sidebar.caption(
+    f"🔑 Using RapidAPI key **{API_KEY[:6]}...{API_KEY[-4:]}**"
+)
+st.sidebar.caption(f"🌐 Host: {HOST_SEARCH}")
+
+def connectivity_test():
+    try:
+        url = f"https://{HOST_SEARCH}/properties/nearby-home-values"
+        params = {"lat": "32.7327132", "lon": "-97.3089965", "radius": "2"}
+        r = requests.get(url, headers=h_search(), params=params, timeout=20)
+        st.sidebar.write(f"Status: {r.status_code}")
+        st.sidebar.code(r.text[:800], language="json")
+    except Exception as e:
+        st.sidebar.error(f"Connectivity error: {e}")
+
+if st.sidebar.button("Test Realtor API Connection"):
+    connectivity_test()
 
 # =========================
 # Helpers
@@ -57,6 +79,7 @@ def load_logo():
 def normalize_address(addr: str) -> str:
     if not addr: return ""
     a = addr.strip()
+    # strip common unit markers for cleaner geocoding
     for token in [" Apt ", " Unit ", " Ste ", " Suite ", "#"]:
         a = a.replace(token, " ")
     return " ".join(a.split())
@@ -75,7 +98,7 @@ def parse_realtor_url(url: str):
         seg = re.search(r"realestateandhomes-detail/([^/?#]+)", url, flags=re.I)
         if not seg: return None
         slug = seg.group(1)
-        slug = slug.split("_M")[0]  # drop the property id tail if present
+        slug = slug.split("_M")[0]  # drop trailing property id if present
         parts = slug.split("_")     # ["1105-Freeman-St", "Fort-Worth", "TX", "76104"]
         if len(parts) >= 4:
             street = parts[0].replace("-", " ")
@@ -87,14 +110,25 @@ def parse_realtor_url(url: str):
     except Exception:
         return None
 
+# ---- Session flag so we don't call a host you're not subscribed to over and over
+if "disable_realtor_autocomplete" not in st.session_state:
+    st.session_state.disable_realtor_autocomplete = False
+
 # =========================
 # Geocoding: Realtor → OSM → (optional) Google
 # =========================
 def resolve_latlon_realtor(addr, debug):
+    if st.session_state.disable_realtor_autocomplete:
+        return None, None, None
     url = f"https://{HOST_SEARCH}/properties/auto-complete"
     r = requests.get(url, headers=h_search(), params={"input": addr}, timeout=20)
     debug.append(("SEARCH auto-complete", r.status_code, r.text[:800]))
-    if r.status_code != 200: return None, None, None
+    if r.status_code == 403:
+        # Not subscribed — stop trying this endpoint for this session
+        st.session_state.disable_realtor_autocomplete = True
+        return None, None, None
+    if r.status_code != 200:
+        return None, None, None
     js = r.json()
     hits = js.get("hits") or js.get("data") or js.get("results") or []
     for h in hits:
@@ -139,11 +173,9 @@ def resolve_to_latlon(address_or_url, debug):
     s = (address_or_url or "").strip()
     if not s: return None, None, None
 
-    # If user pasted a Realtor URL, parse a clean address guess
+    # If it's a Realtor URL, parse a USPS-style address guess
     if is_url(s):
-        addr_guess = parse_realtor_url(s)
-        if not addr_guess:
-            return None, None, None
+        addr_guess = parse_realtor_url(s) or s
         addr_guess = normalize_address(addr_guess)
         lat, lon, disp = resolve_latlon_realtor(addr_guess, debug)
         if lat and lon: return lat, lon, disp
@@ -160,31 +192,91 @@ def resolve_to_latlon(address_or_url, debug):
     return resolve_latlon_google(addr, debug)
 
 # =========================
-# Comps (Realtor Search only)
+# Comps fetch with backoff + session cache
 # =========================
-def fetch_nearby_values(lat, lon, radius_miles=2.0, limit=25, debug=None):
-    try:
-        url = f"https://{HOST_SEARCH}/properties/nearby-home-values"
-        params = {"lat": str(lat), "lon": str(lon), "radius": str(radius_miles)}
+if "nearby_cache" not in st.session_state:
+    st.session_state.nearby_cache = {}
+
+def fetch_nearby_values_once(lat, lon, radius_miles=2.0, limit=25, debug=None):
+    cache_key = (round(lat,6), round(lon,6), float(radius_miles))
+    if cache_key in st.session_state.nearby_cache:
+        return st.session_state.nearby_cache[cache_key]
+
+    url = f"https://{HOST_SEARCH}/properties/nearby-home-values"
+    params = {"lat": str(lat), "lon": str(lon), "radius": str(radius_miles)}
+    backoffs = [0, 6, 12, 24]  # seconds; tuned to avoid 429 loops
+    last_rows = []
+
+    for wait in backoffs:
+        if wait:
+            time.sleep(wait)
         r = requests.get(url, headers=h_search(), params=params, timeout=25)
         if debug is not None:
-            debug.append(("SEARCH nearby-home-values", r.status_code, r.text[:800]))
-        if r.status_code != 200: return []
+            dbg_body = r.text[:800]
+            debug.append((f"SEARCH nearby-home-values r={radius_miles} wait={wait}", r.status_code, dbg_body))
+
+        if r.status_code == 429:
+            # Too many requests → back off and retry
+            continue
+        if r.status_code != 200:
+            break
+
         js = r.json()
-        raw = js.get("data") or js.get("results") or js.get("homes") or js.get("listings") or js.get("properties") or []
-        comps = []
+        raw = js.get("data", {}).get("home_search", {}).get("results", []) \
+              or js.get("data") or js.get("results") or js.get("homes") \
+              or js.get("listings") or js.get("properties") or []
+        rows = []
         for it in raw[:limit]:
-            price = it.get("price") or it.get("list_price") or it.get("value") or it.get("estimate") or it.get("avm", {}).get("value")
+            price = it.get("price") or it.get("list_price") or it.get("value") or it.get("estimate") \
+                    or (it.get("current_estimates")[0]["estimate"] if isinstance(it.get("current_estimates"), list) and it.get("current_estimates") else None) \
+                    or (it.get("avm", {}).get("value") if isinstance(it.get("avm"), dict) else None)
             dom = it.get("days_on_market") or it.get("dom")
-            sqft = (it.get("building_size", {}).get("size") or it.get("sqft") or it.get("living_area"))
-            line = (it.get("address", {}).get("line") or it.get("address_line") or it.get("line") or "")
-            city = it.get("address", {}).get("city") or it.get("city") or ""
+            size_field = it.get("building_size", {})
+            if isinstance(size_field, dict):
+                sqft = size_field.get("size")
+            else:
+                sqft = size_field or it.get("sqft") or it.get("living_area")
+            a = it.get("location", {}).get("address", {}) if isinstance(it.get("location"), dict) else {}
+            line = a.get("line") or (it.get("address", {}) or {}).get("line") or it.get("address_line") or it.get("line") or ""
+            city = a.get("city") or (it.get("address", {}) or {}).get("city") or it.get("city") or ""
             addr = ", ".join([p for p in [line, city] if p]) or it.get("address") or ""
             if addr:
-                comps.append({"address": addr, "price": float(price) if price else None, "dom": int(dom) if dom else None, "sqft": int(sqft) if sqft else None})
-        return comps
-    except Exception:
-        return []
+                rows.append({
+                    "address": addr,
+                    "price": float(price) if price else None,
+                    "dom": int(dom) if dom else None,
+                    "sqft": int(sqft) if sqft else None
+                })
+        last_rows = rows
+        break  # successful 200 → stop retrying
+
+    st.session_state.nearby_cache[cache_key] = last_rows
+    return last_rows
+
+def dedupe_props(rows):
+    seen = set(); out = []
+    for r in rows:
+        k = (r.get("address"), r.get("price"), r.get("sqft"))
+        if k not in seen:
+            seen.add(k); out.append(r)
+    return out
+
+def fetch_nearby_values(lat, lon, radius_miles=2.0, limit=25, debug=None):
+    # Try caller radius first
+    results = fetch_nearby_values_once(lat, lon, radius_miles, limit, debug)
+    results = dedupe_props(results)
+    if len(results) >= 8:
+        return results[:limit]
+
+    # If thin, widen gently (avoid hammering API; no parallel calls)
+    for rmi in [3.0, 5.0]:
+        rows = fetch_nearby_values_once(lat, lon, rmi, limit, debug)
+        results.extend(rows)
+        results = dedupe_props(results)
+        if len(results) >= 8:
+            break
+
+    return results[:limit]
 
 # =========================
 # Risk model
@@ -214,6 +306,7 @@ def classify_risk(subject_price, subject_dom, comp_prices, comp_doms):
         dom_diff = (subject_dom - comp_dom) / comp_dom * 100
         reasons.append(f"Subject DOM vs comps: {subject_dom} vs {int(comp_dom)} ({dom_diff:+.0f}%).")
 
+    # scoring
     price_pen = 5.0 if price_diff is None else max(0.0, min(10.0, (price_diff / 25.0) * 10.0))
     dom_pen   = 3.0 if dom_diff is None else max(0.0, min(10.0, (dom_diff / 150.0) * 10.0))
     score = 0.7 * price_pen + 0.3 * dom_pen
@@ -225,17 +318,26 @@ def classify_risk(subject_price, subject_dom, comp_prices, comp_doms):
     return band, round(score,1), prob60, reasons
 
 def suggestions_for(band):
-    if band == "Low": return ["Standard contingency; 30-day listing deadline.", "Minor concessions if no offer by Day 21."]
-    if band == "Moderate": return ["Staging + pro photos; weekly agent feedback.", "Auto price cuts 1% at Day 21 and Day 35 if no offers."]
-    if band == "High": return ["Aggressive pricing at/under comp median; refresh marketing weekly.", "Builder may extend close or convert to non-contingent if not under contract by Day 60."]
-    return ["Insufficient data — require tight listing + adjustment plan."]
+    if band == "Low": return [
+        "Standard contingency; list within 30 days at competitive pricing.",
+        "Minor concessions if no offer by Day 21; maintain weekly agent feedback."
+    ]
+    if band == "Moderate": return [
+        "Staging & pro photos; weekly agent feedback to builder.",
+        "Auto price reductions of ~1% at Day 21 and Day 35 if no offers."
+    ]
+    if band == "High": return [
+        "List at/under comp median day one; refresh marketing weekly.",
+        "Builder may extend close or convert to non-contingent if not under contract by Day 60."
+    ]
+    return ["Insufficient data — require tight listing timeline + adjustment plan."]
 
 # =========================
 # Charts
 # =========================
-def bar_chart_with_subject(subject, values, labels, title, ylabel, color="#5fa8d3"):
+def bar_chart_with_subject(subject, values, labels, title, ylabel):
     fig, ax = plt.subplots(figsize=(8, 4))
-    ax.bar(labels, values, color=color, label="Comparable Properties")
+    ax.bar(labels, values, label="Comparable Properties")
     if subject:
         ax.axhline(subject, color="#e07a5f", linestyle="--", linewidth=2, label="Subject (proxy)")
     ax.set_title(title); ax.set_ylabel(ylabel)
@@ -273,10 +375,11 @@ def build_pdf(report):
 # =========================
 # UI
 # =========================
-st.title("🏡 Contingent Property Risk Analysis — Realtor Search only")
-st.caption("Paste a Realtor URL *or* type a full address. We parse → geocode (Realtor → OSM → optional Google) → pull comps → risk it.")
+st.title("🏡 Contingent Property Risk Analysis")
+st.caption("Paste a Realtor URL *or* type a full address. We parse → geocode (Realtor→OSM→optional Google) → comps → risk → PDF.")
 
 addr_or_url = st.text_input("Enter Address or Realtor.com URL", placeholder="e.g., 1105 Freeman St, Fort Worth, TX 76104 or https://www.realtor.com/realestateandhomes-detail/...")
+
 with st.expander("If the address can’t be resolved, enter coordinates manually"):
     use_manual = st.checkbox("Use manual latitude/longitude")
     colm1, colm2 = st.columns(2)
@@ -306,15 +409,40 @@ if go:
             st.subheader("Debug Panel"); st.json(debug_notes)
         st.stop()
 
-    # Fetch comps (Realtor Search only)
+    # Fetch comps
     with st.spinner("Fetching comps…"):
         comps = fetch_nearby_values(lat, lon, radius_miles=radius, limit=limit, debug=debug_notes)
 
     if not comps:
-        st.warning("No comps returned by Realtor Search for this area/radius. Try widening the radius, another nearby address, or enable a second data source later.")
-        if show_debug:
-            st.subheader("Debug Panel"); st.json(debug_notes)
-        st.stop()
+        st.warning("No comps returned automatically. Enter a few comps manually to generate a report.")
+        with st.expander("Enter comps manually (Address, Price, DOM, SqFt)"):
+            comp_rows = st.data_editor(
+                pd.DataFrame([{"Address":"", "Price":"", "DOM":"", "SqFt":""} for _ in range(5)]),
+                num_rows="dynamic",
+                use_container_width=True
+            )
+            if st.button("Use Manual Comps"):
+                comps = []
+                for _, row in comp_rows.iterrows():
+                    addr = str(row.get("Address") or "").strip()
+                    if not addr: continue
+                    # parse numerics safely
+                    def to_float(x):
+                        try: return float(str(x).replace(",", "").strip())
+                        except: return None
+                    def to_int(x):
+                        try: return int(str(x).strip())
+                        except: return None
+                    comps.append({
+                        "address": addr,
+                        "price": to_float(row.get("Price")),
+                        "dom": to_int(row.get("DOM")),
+                        "sqft": to_int(row.get("SqFt"))
+                    })
+        if not comps:
+            if show_debug:
+                st.subheader("Debug Panel"); st.json(debug_notes)
+            st.stop()
 
     # Subject proxy & risk
     subject = subject_from_comps(comps)
@@ -349,29 +477,30 @@ if go:
 
     st.subheader("Comparable Properties")
     df = pd.DataFrame([{
-        "Address": abbreviate(c["address"], 40),
+        "Address": abbreviate(c["address"], 42),
         "Price": fmt_money(c["price"]),
         "DOM": c["dom"] if c["dom"] else "—",
         "SqFt": c["sqft"] if c["sqft"] else "—",
     } for c in comps])
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df, use_container_width=True, height=min(500, 42 + 28*len(df)), hide_index=True)
 
     st.subheader("Visuals")
     labels = [abbreviate(c["address"], 18) for c in comps[:12]]
-    values = [c["price"] if c["price"] else 0 for c in comps[:12]]
+    values_price = [c["price"] if c["price"] else 0 for c in comps[:12]]
+
     # Price chart
     fig1, ax1 = plt.subplots(figsize=(8, 4))
-    ax1.bar(labels, values, label="Comparable Properties")
+    ax1.bar(labels, values_price, label="Comparable Properties")
     if subject_price: ax1.axhline(subject_price, color="#e07a5f", linestyle="--", linewidth=2, label="Subject (proxy)")
     ax1.set_title("Pricing vs Nearby Values (subject proxy dashed)"); ax1.set_ylabel("Price ($)")
     ax1.legend(loc="upper right"); plt.xticks(rotation=20, ha="right")
     st.pyplot(fig1)
 
     # DOM chart
-    if comp_doms:
+    comp_doms_trim = [c["dom"] if c["dom"] else 0 for c in comps[:12]]
+    if any(comp_doms_trim):
         fig2, ax2 = plt.subplots(figsize=(8, 4))
-        dom_vals = [c["dom"] if c["dom"] else 0 for c in comps[:12]]
-        ax2.bar(labels, dom_vals, label="Comparable Properties")
+        ax2.bar(labels, comp_doms_trim, label="Comparable Properties")
         if subject_dom: ax2.axhline(subject_dom, color="#e07a5f", linestyle="--", linewidth=2, label="Subject (proxy)")
         ax2.set_title("Days on Market vs Comps"); ax2.set_ylabel("Days")
         ax2.legend(loc="upper right"); plt.xticks(rotation=20, ha="right")
@@ -398,6 +527,7 @@ if go:
     if show_debug:
         st.subheader("Debug Panel")
         st.json(debug_notes)
+
 
 
 
